@@ -95,6 +95,30 @@ fi
 EMULATOR_BIN="$ANDROID_HOME/emulator/$EMULATOR"
 ADB_BIN="$ANDROID_HOME/platform-tools/$ADB"
 
+# ---------------------------------------------------------------------------
+# Unattended operation. Set these to drive the tool from a script, CI job or
+# an MCP server, where there is nobody to answer a prompt:
+#
+#   ANDROID_ENV_YES=1              never prompt; take the documented default
+#   ANDROID_ENV_AVD_NAME=<name>    emulator name for setup, instead of asking
+#   ANDROID_ENV_PROFILE=1|2|3      device profile for setup, instead of asking
+#   ANDROID_ENV_BOOT_TIMEOUT=<s>   how long `start --wait` and `ensure` wait
+#                                  for the emulator to report booted (default 300)
+#
+# Every prompt in this script checks noninteractive() first.
+ANDROID_ENV_YES="${ANDROID_ENV_YES:-0}"
+ANDROID_ENV_BOOT_TIMEOUT="${ANDROID_ENV_BOOT_TIMEOUT:-300}"
+
+function noninteractive() {
+    [ "$ANDROID_ENV_YES" = "1" ] && return 0
+    # No usable stdin (piped, redirected from /dev/null, or no tty) also means
+    # nobody can answer, so do not hang waiting.
+    [ -t 0 ] || return 0
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+
 # Records which build this script installed, so upgrades can be detected.
 CMD_TOOLS_MARKER="$ANDROID_HOME/cmdline-tools/latest/.oneclick-build"
 
@@ -138,7 +162,9 @@ function show_help() {
     echo "  setup     Install Android SDK, Platform Tools, and Emulator"
     echo "  doctor    Check environment status and missing dependencies"
     echo "  list      List available Android Virtual Devices (AVDs)"
-    echo "  start     Start an emulator"
+    echo "  start     Start an emulator. --wait blocks until it has booted"
+    echo "  stop      Stop a running emulator (all of them if none is named)"
+    echo "  ensure    Guarantee a booted emulator, provisioning if needed (--json)"
     echo "  delete    Delete an emulator and its desktop shortcut"
     echo "  tools     Show installed vs. available command-line tools"
     echo "  install   Put this script on your PATH so it runs from anywhere"
@@ -621,8 +647,15 @@ function do_setup() {
         echo -e "\n${YELLOW}Notice: You already have the following Emulators installed:${NC}"
         echo -e "${GREEN}$EXISTING_AVDS${NC}"
         echo "Since you already have everything set up, you may not need to install again."
-        read -p "Do you want to skip installation and exit? (y/n) [y]: " SKIP_INSTALL
-        SKIP_INSTALL=${SKIP_INSTALL:-y}
+        if noninteractive; then
+            # Unattended callers want the SDK and a named AVD to exist, not an
+            # early exit, so carry on rather than taking the interactive default.
+            SKIP_INSTALL="n"
+            echo "Unattended mode: continuing instead of skipping."
+        else
+            read -p "Do you want to skip installation and exit? (y/n) [y]: " SKIP_INSTALL
+            SKIP_INSTALL=${SKIP_INSTALL:-y}
+        fi
         if [[ "$SKIP_INSTALL" == "y" || "$SKIP_INSTALL" == "Y" ]]; then
             echo -e "Installation skipped. You can start your emulator anytime using '$SELF start'"
             return 0
@@ -662,7 +695,15 @@ function do_setup() {
     echo "p) Preview Skins in Browser"
 
     while true; do
-        read -p "Enter choice (1, 2, 3, or p) [1]: " AVD_CHOICE
+        if [ -n "${ANDROID_ENV_PROFILE:-}" ]; then
+            AVD_CHOICE="$ANDROID_ENV_PROFILE"
+            echo "Using profile $AVD_CHOICE (ANDROID_ENV_PROFILE)"
+        elif noninteractive; then
+            AVD_CHOICE=1
+            echo "Unattended mode: using profile 1 (Pixel 6 Pro)"
+        else
+            read -p "Enter choice (1, 2, 3, or p) [1]: " AVD_CHOICE
+        fi
         AVD_CHOICE=${AVD_CHOICE:-1}
         case "$AVD_CHOICE" in
             p|P)
@@ -673,12 +714,23 @@ function do_setup() {
                 break
                 ;;
             *)
+                if [ -n "${ANDROID_ENV_PROFILE:-}" ] || noninteractive; then
+                    die "Invalid profile '$AVD_CHOICE'. ANDROID_ENV_PROFILE must be 1, 2 or 3."
+                fi
                 warn "'$AVD_CHOICE' is not a valid choice. Enter 1, 2, 3, or p."
                 ;;
         esac
     done
 
-    read -p "Enter a name for your Emulator (e.g. MyPixelPhone): " CUSTOM_NAME
+    if [ -n "${ANDROID_ENV_AVD_NAME:-}" ]; then
+        CUSTOM_NAME="$ANDROID_ENV_AVD_NAME"
+        echo "Using name $CUSTOM_NAME (ANDROID_ENV_AVD_NAME)"
+    elif noninteractive; then
+        CUSTOM_NAME="Android_Emulator"
+        echo "Unattended mode: using name $CUSTOM_NAME"
+    else
+        read -p "Enter a name for your Emulator (e.g. MyPixelPhone): " CUSTOM_NAME
+    fi
     # Sanitize name: avdmanager only accepts [a-zA-Z0-9._-]
     CUSTOM_NAME="${CUSTOM_NAME// /_}"
     CUSTOM_NAME=$(printf '%s' "$CUSTOM_NAME" | tr -cd 'a-zA-Z0-9._-')
@@ -817,6 +869,9 @@ function do_delete() {
         echo -e "${YELLOW}Available Android Virtual Devices:${NC}"
         echo "$avds"
         echo ""
+        if noninteractive; then
+            die "No emulator named. Pass one, e.g. $SELF delete <name> -y"
+        fi
         read -p "Which emulator should be deleted? (blank to cancel): " avd_name
         if [ -z "$avd_name" ]; then
             echo "Cancelled. Nothing was deleted."
@@ -852,6 +907,9 @@ function do_delete() {
     echo "The SDK, system images and your other emulators are not touched."
     echo ""
 
+    if [ "$assume_yes" -ne 1 ] && noninteractive; then
+        die "Refusing to delete '$avd_name' unattended without -y."
+    fi
     if [ "$assume_yes" -ne 1 ]; then
         read -p "Type the emulator name to confirm: " confirm
         if [ "$confirm" != "$avd_name" ]; then
@@ -946,12 +1004,23 @@ function do_install() {
             install_path_hint "$target_dir" "$name"
             return 0
         fi
-        warn "$dest already exists and does not point at this script."
-        read -p "Replace it? (y/n) [n]: " replace
-        case "${replace:-n}" in
-            y|Y) ;;
-            *) echo "Left $dest alone. Nothing was installed."; return 0 ;;
-        esac
+        if [ -L "$dest" ] && [ ! -e "$dest" ]; then
+            # Dangling symlink: the previous source directory was moved or
+            # deleted. Nothing is lost by replacing it, so do not ask.
+            warn "Replacing a broken symlink at $dest"
+            warn "  it pointed at ${existing:-an unknown path}"
+            rm -f "$dest"
+        elif noninteractive; then
+            die "$dest already exists and does not point at this script.
+Remove it first, or re-run interactively to be asked."
+        else
+            warn "$dest already exists and does not point at this script."
+            read -p "Replace it? (y/n) [n]: " replace
+            case "${replace:-n}" in
+                y|Y) ;;
+                *) echo "Left $dest alone. Nothing was installed."; return 0 ;;
+            esac
+        fi
     fi
 
     # A symlink means edits to the script take effect immediately. Copy is the
@@ -1049,26 +1118,248 @@ function do_list() {
     fi
 }
 
+# Serial of the running emulator that hosts this AVD, if any.
+function emulator_serial_for() {
+    local avd_name=$1 serial
+    [ -x "$ADB_BIN" ] || return 1
+    for serial in $("$ADB_BIN" devices 2>/dev/null | awk '/^emulator-/{print $1}'); do
+        local got
+        got=$("$ADB_BIN" -s "$serial" emu avd name 2>/dev/null | head -n 1 | tr -d '\r')
+        if [ "$got" = "$avd_name" ]; then
+            printf '%s' "$serial"
+            return 0
+        fi
+    done
+    return 1
+}
+
+function avd_is_running() {
+    pgrep -f -- "-avd $1([[:space:]]|\$)" > /dev/null 2>&1
+}
+
+# Block until the emulator reports a completed boot. Prints the serial.
+function wait_for_boot() {
+    local avd_name=$1 timeout=${2:-$ANDROID_ENV_BOOT_TIMEOUT}
+    local waited=0 serial=""
+
+    [ -x "$ADB_BIN" ] || die "adb not found at $ADB_BIN. Run '$SELF setup' first."
+
+    while [ "$waited" -lt "$timeout" ]; do
+        if ! avd_is_running "$avd_name" && [ "$waited" -gt 10 ]; then
+            die "Emulator process for '$avd_name' exited before finishing boot."
+        fi
+        serial=$(emulator_serial_for "$avd_name" 2>/dev/null || true)
+        if [ -n "$serial" ]; then
+            local booted
+            booted=$("$ADB_BIN" -s "$serial" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r\n')
+            if [ "$booted" = "1" ]; then
+                printf '%s' "$serial"
+                return 0
+            fi
+        fi
+        sleep 2
+        waited=$((waited + 2))
+    done
+    return 1
+}
+
 function do_start() {
-    AVD_NAME=$1
-    if [ -z "$AVD_NAME" ]; then
-        # Try to find a default one
-        AVD_NAME=$(list_avd_names)
-        AVD_NAME=${AVD_NAME%%$'\n'*}
-        if [ -z "$AVD_NAME" ]; then
+    local avd_name="" wait_for=0 timeout="$ANDROID_ENV_BOOT_TIMEOUT" arg
+    for arg in "$@"; do
+        case "$arg" in
+            -w|--wait)   wait_for=1 ;;
+            --timeout=*) timeout="${arg#--timeout=}" ;;
+            -*)          die "Unknown option: $arg" ;;
+            *)           [ -z "$avd_name" ] && avd_name="$arg" ;;
+        esac
+    done
+
+    if [ -z "$avd_name" ]; then
+        avd_name=$(list_avd_names)
+        avd_name=${avd_name%%$'\n'*}
+        if [ -z "$avd_name" ]; then
             die "No AVDs found. Run '$SELF setup' first."
         fi
-        echo "No AVD specified, using default: $AVD_NAME"
-    elif ! avd_exists "$AVD_NAME"; then
-        die "AVD '$AVD_NAME' not found. Run '$SELF list' to see what exists."
+        echo "No AVD specified, using default: $avd_name"
+    elif ! avd_exists "$avd_name"; then
+        die "AVD '$avd_name' not found. Run '$SELF list' to see what exists."
     fi
 
     [ -x "$EMULATOR_BIN" ] || die "Emulator not installed at $EMULATOR_BIN. Run '$SELF setup' first."
 
-    echo -e "Starting emulator: ${YELLOW}$AVD_NAME${NC}..."
-    nohup "$EMULATOR_BIN" -avd "$AVD_NAME" > /dev/null 2>&1 &
-    echo -e "${GREEN}✓ Emulator booting in background${NC}"
+    # Already up? Do not start a second copy of the same AVD.
+    if avd_is_running "$avd_name"; then
+        echo -e "${GREEN}✓ $avd_name is already running${NC}"
+    else
+        echo -e "Starting emulator: ${YELLOW}$avd_name${NC}..."
+        nohup "$EMULATOR_BIN" -avd "$avd_name" > /dev/null 2>&1 &
+        echo -e "${GREEN}✓ Emulator booting in background${NC}"
+    fi
+
+    if [ "$wait_for" -eq 1 ]; then
+        echo "Waiting up to ${timeout}s for boot to complete..."
+        local serial
+        if serial=$(wait_for_boot "$avd_name" "$timeout"); then
+            echo -e "${GREEN}✓ $avd_name booted ($serial)${NC}"
+        else
+            die "'$avd_name' did not finish booting within ${timeout}s."
+        fi
+    fi
 }
+
+function do_stop() {
+    local avd_name=$1
+
+    if [ -z "$avd_name" ]; then
+        # Stop every running emulator.
+        local any=0 serial
+        if [ -x "$ADB_BIN" ]; then
+            for serial in $("$ADB_BIN" devices 2>/dev/null | awk '/^emulator-/{print $1}'); do
+                "$ADB_BIN" -s "$serial" emu kill > /dev/null 2>&1 && any=1
+                echo -e "${GREEN}✓ Stopped $serial${NC}"
+            done
+        fi
+        [ "$any" -eq 1 ] || echo "No running emulators."
+        return 0
+    fi
+
+    if ! avd_is_running "$avd_name"; then
+        echo "'$avd_name' is not running."
+        return 0
+    fi
+
+    local serial
+    serial=$(emulator_serial_for "$avd_name" 2>/dev/null || true)
+    if [ -n "$serial" ] && [ -x "$ADB_BIN" ]; then
+        "$ADB_BIN" -s "$serial" emu kill > /dev/null 2>&1 || true
+    fi
+
+    # Fall back to signalling the process if the console command did not take.
+    local waited=0
+    while avd_is_running "$avd_name" && [ "$waited" -lt 20 ]; do
+        sleep 1
+        waited=$((waited + 1))
+    done
+    if avd_is_running "$avd_name"; then
+        pkill -f -- "-avd $avd_name([[:space:]]|\$)" 2>/dev/null || true
+        while avd_is_running "$avd_name" && [ "$waited" -lt 40 ]; do
+            sleep 1
+            waited=$((waited + 1))
+        done
+    fi
+
+    if avd_is_running "$avd_name"; then
+        die "Could not stop '$avd_name'."
+    fi
+    echo -e "${GREEN}✓ Stopped $avd_name${NC}"
+}
+
+# One call that guarantees a booted, ready emulator. Intended for scripts and
+# MCP servers: provisions the SDK and creates the AVD if either is missing,
+# starts it if it is not running, then waits for boot and prints the serial.
+function do_ensure() {
+    local avd_name="" timeout="$ANDROID_ENV_BOOT_TIMEOUT" as_json=0 arg
+    for arg in "$@"; do
+        case "$arg" in
+            --json)      as_json=1 ;;
+            --timeout=*) timeout="${arg#--timeout=}" ;;
+            -*)          die "Unknown option: $arg" ;;
+            *)           [ -z "$avd_name" ] && avd_name="$arg" ;;
+        esac
+    done
+
+    # Everything below must run unattended.
+    export ANDROID_ENV_YES=1
+
+    local log="${TMPDIR:-/tmp}/android-env-ensure.$$.log"
+    local created=0 provisioned=0
+
+    # 1. SDK and at least one AVD.
+    local have_avd=0
+    if [ -n "$avd_name" ]; then
+        avd_exists "$avd_name" && have_avd=1
+    else
+        avd_name=$(list_avd_names)
+        avd_name=${avd_name%%$'\n'*}
+        [ -n "$avd_name" ] && have_avd=1
+    fi
+
+    if [ "$have_avd" -eq 0 ] || [ ! -x "$EMULATOR_BIN" ]; then
+        [ -n "$avd_name" ] && export ANDROID_ENV_AVD_NAME="${avd_name%_API_34}"
+        if [ "$as_json" -eq 1 ]; then
+            do_setup > "$log" 2>&1 || {
+                json_fail "setup failed; see $log" "$avd_name"
+                return 1
+            }
+        else
+            do_setup || die "setup failed"
+        fi
+        provisioned=1
+        created=1
+        # setup names the AVD <name>_API_34.
+        if [ -z "$avd_name" ] || ! avd_exists "$avd_name"; then
+            avd_name=$(list_avd_names)
+            avd_name=${avd_name%%$'\n'*}
+        fi
+    fi
+
+    [ -n "$avd_name" ] || { json_or_die "$as_json" "No emulator available after setup." ""; return 1; }
+
+    # 2. Running.
+    local was_running=0
+    if avd_is_running "$avd_name"; then
+        was_running=1
+    else
+        [ -x "$EMULATOR_BIN" ] || { json_or_die "$as_json" "Emulator binary missing at $EMULATOR_BIN" "$avd_name"; return 1; }
+        nohup "$EMULATOR_BIN" -avd "$avd_name" > /dev/null 2>&1 &
+    fi
+
+    # 3. Booted.
+    local serial
+    if ! serial=$(wait_for_boot "$avd_name" "$timeout" 2>/dev/null); then
+        json_or_die "$as_json" "'$avd_name' did not finish booting within ${timeout}s." "$avd_name"
+        return 1
+    fi
+
+    local api abi
+    api=$("$ADB_BIN" -s "$serial" shell getprop ro.build.version.sdk 2>/dev/null | tr -d '\r\n')
+    abi=$("$ADB_BIN" -s "$serial" shell getprop ro.product.cpu.abi 2>/dev/null | tr -d '\r\n')
+
+    if [ "$as_json" -eq 1 ]; then
+        printf '{"success":true,"avd":"%s","serial":"%s","api_level":"%s","abi":"%s","already_running":%s,"provisioned":%s}\n' \
+            "$avd_name" "$serial" "$api" "$abi" \
+            "$([ "$was_running" -eq 1 ] && echo true || echo false)" \
+            "$([ "$provisioned" -eq 1 ] && echo true || echo false)"
+    else
+        echo -e "${GREEN}✓ $avd_name ready${NC}"
+        echo "  serial:    $serial"
+        echo "  api level: $api"
+        echo "  abi:       $abi"
+        [ "$created" -eq 1 ] && echo "  (created by this run)"
+        [ "$was_running" -eq 1 ] && echo "  (was already running)"
+    fi
+}
+
+function json_fail() {
+    printf '{"success":false,"error":%s,"avd":"%s"}\n' "$(json_string "$1")" "$2"
+}
+
+# Minimal JSON string escaping for error messages.
+function json_string() {
+    printf '%s' "$1" | awk '{
+        gsub(/\\/, "\\\\"); gsub(/"/, "\\\""); gsub(/\t/, " ");
+        printf "%s%s", (NR>1 ? " " : ""), $0
+    } END { }' | sed 's/^/"/; s/$/"/'
+}
+
+function json_or_die() {
+    if [ "$1" = "1" ]; then
+        json_fail "$2" "$3"
+    else
+        die "$2"
+    fi
+}
+
 
 # Main Command Router
 case "$1" in
@@ -1091,7 +1382,15 @@ case "$1" in
         do_uninstall
         ;;
     start)
-        do_start "$2"
+        shift
+        do_start "$@"
+        ;;
+    stop)
+        do_stop "$2"
+        ;;
+    ensure)
+        shift
+        do_ensure "$@"
         ;;
     delete)
         shift

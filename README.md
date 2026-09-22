@@ -78,6 +78,8 @@ directory holding the script.
 | `delete [name]` | Deletes an emulator and its desktop launcher |
 | `doctor` | Checks Java, the SDK, and every tool the script needs |
 | `tools` | Shows your command-line tools version and whether a newer one exists |
+| `stop [name]` | Stops a running emulator, or all of them if none is named |
+| `ensure [name]` | Guarantees a booted emulator, provisioning first if needed |
 | `install [dir]` | Puts the command on your PATH so it runs from anywhere |
 | `uninstall` | Removes it from your PATH |
 | `version` | Prints the version |
@@ -118,6 +120,46 @@ To remove it again:
 
 Uninstalling only removes the command from your PATH. Your SDK, emulators and
 desktop launchers are left alone.
+
+
+## Unattended use
+
+`ensure` is the one call to make from a script, a CI job or an MCP server. It
+guarantees a booted, ready emulator: it provisions the SDK and creates an
+emulator if either is missing, starts it if it is not running, waits for the
+boot to finish, and prints the serial.
+
+    android-env ensure --json
+
+    {"success":true,"avd":"Pixel6Pro_API_34","serial":"emulator-5554",
+     "api_level":"34","abi":"arm64-v8a","already_running":false,
+     "provisioned":false}
+
+It is safe to call repeatedly. If the emulator is already booted it returns in
+about a second with `already_running: true`. Failures come back as
+`{"success": false, "error": "..."}` rather than a non-zero exit with no
+detail, so a caller can report the reason.
+
+To boot a specific emulator and wait without the provisioning step:
+
+    android-env start MyPixelPhone_API_34 --wait --timeout=300
+
+To shut down:
+
+    android-env stop                      # every running emulator
+    android-env stop MyPixelPhone_API_34  # just this one
+
+These variables drive the tool where nobody can answer a prompt:
+
+| Variable | Effect |
+| --- | --- |
+| `ANDROID_ENV_YES=1` | Never prompt, take the documented default |
+| `ANDROID_ENV_AVD_NAME` | Emulator name for `setup`, instead of asking |
+| `ANDROID_ENV_PROFILE` | Device profile for `setup`: 1, 2 or 3 |
+| `ANDROID_ENV_BOOT_TIMEOUT` | Seconds to wait for boot, default 300 |
+
+Prompts are also skipped automatically when stdin is not a terminal, so piping
+into the tool will not hang it.
 
 
 ## Configuration
