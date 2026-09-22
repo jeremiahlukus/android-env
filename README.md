@@ -86,6 +86,16 @@ You can also use the script to manage your environment from the terminal:
   ./android-env list
   ```
 
+- **Delete an Emulator:** (Removes the AVD *and* the desktop shortcut created for it)
+  ```bash
+  ./android-env delete                       # pick from a list
+  ./android-env delete MyPixelPhone_API_34   # or name it directly
+  ```
+  You are shown exactly what will be removed, with its size, and must retype the
+  emulator name to confirm. Add `-y` to skip the prompt. Deleting refuses while
+  that emulator is running, and never touches the SDK, system images, or your
+  other AVDs.
+
 - **Inspect SDK Tooling:** (Shows the installed command-line tools revision, the newest available build, and every override)
   ```bash
   ./android-env tools
@@ -155,6 +165,11 @@ warns you when it detects one.
 - **SDK install logs** are kept at `$ANDROID_HOME/.oneclick-sdk-install.log`.
 - **`sdkmanager` warns that it is deprecated.** Expected on command-line tools rev 23+; it delegates to the `android` CLI. This tool calls the `android` CLI directly, so you will only see this with `ANDROID_ENV_USE_SDKMANAGER=1`.
 - **`SDK XML versions up to 3 but ... version 4 was encountered`** means your command-line tools are older than the rest of your SDK. Upgrade with `ANDROID_CMDLINE_TOOLS_UPGRADE=1 ./android-env setup`.
+- **Reclaiming disk space.** AVDs are large — often several GB each. `./android-env delete` removes one along with its shortcut. To drop the downloaded system image as well:
+  ```bash
+  android --no-metrics --sdk="$ANDROID_HOME" sdk remove \
+    system-images/android-34/google_apis/arm64-v8a platforms/android-34
+  ```
 
 ---
 

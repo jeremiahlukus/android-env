@@ -129,6 +129,7 @@ function show_help() {
     echo "  doctor    Check environment status and missing dependencies"
     echo "  list      List available Android Virtual Devices (AVDs)"
     echo "  start     Start an emulator"
+    echo "  delete    Delete an emulator and its desktop shortcut"
     echo "  tools     Show installed vs. available command-line tools"
     echo "  version   Show version"
     echo ""
@@ -763,6 +764,114 @@ function do_tools() {
     echo ""
 }
 
+# Path of the desktop shortcut create_shortcut() would have made for an AVD.
+# setup names the AVD "<name>_API_<level>" and the shortcut "<name>", so the
+# suffix is stripped back off here.
+function shortcut_path_for() {
+    local avd_name=$1
+    local short_name="${avd_name%_API_[0-9]*}"
+    # Parameter expansion cannot do a numeric class, so verify and fall back.
+    case "$avd_name" in
+        *_API_[0-9]*) short_name=$(printf '%s' "$avd_name" | sed -E 's/_API_[0-9]+$//') ;;
+        *)            short_name="$avd_name" ;;
+    esac
+
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        printf '%s' "$HOME/Applications/$short_name.app"
+    elif [[ "$OSTYPE" == "linux-gnu"* ]]; then
+        printf '%s' "$HOME/.local/share/applications/$short_name.desktop"
+    elif [[ "$OSTYPE" == "msys" || "$OSTYPE" == "cygwin" ]]; then
+        local start_menu="$APPDATA/Microsoft/Windows/Start Menu/Programs"
+        [ -d "$start_menu" ] || start_menu="$USERPROFILE/Desktop"
+        printf '%s' "$start_menu/$short_name.bat"
+    fi
+}
+
+function do_delete() {
+    local avd_name="" assume_yes=0 arg
+    for arg in "$@"; do
+        case "$arg" in
+            -y|--yes) assume_yes=1 ;;
+            -*)       die "Unknown option: $arg" ;;
+            *)        [ -z "$avd_name" ] && avd_name="$arg" ;;
+        esac
+    done
+
+    local avds
+    avds=$(list_avd_names)
+    [ -n "$avds" ] || die "No AVDs found in $AVD_HOME. Nothing to delete."
+
+    if [ -z "$avd_name" ]; then
+        echo -e "${YELLOW}Available Android Virtual Devices:${NC}"
+        echo "$avds"
+        echo ""
+        read -p "Which emulator should be deleted? (blank to cancel): " avd_name
+        if [ -z "$avd_name" ]; then
+            echo "Cancelled. Nothing was deleted."
+            return 0
+        fi
+    fi
+
+    avd_exists "$avd_name" \
+        || die "AVD '$avd_name' not found. Run './android-env list' to see what exists."
+
+    # Refuse to delete an AVD that is currently booted. Anchored so that a
+    # running "Foo_API_34_v2" does not block deletion of "Foo_API_34".
+    if pgrep -f -- "-avd $avd_name([[:space:]]|\$)" > /dev/null 2>&1; then
+        die "'$avd_name' is currently running. Stop the emulator first, then retry."
+    fi
+
+    local avd_dir="$AVD_HOME/$avd_name.avd"
+    local shortcut
+    shortcut=$(shortcut_path_for "$avd_name")
+
+    echo -e "\n${YELLOW}This will permanently delete:${NC}"
+    local size="unknown size"
+    [ -d "$avd_dir" ] && size=$(du -sh "$avd_dir" 2>/dev/null | cut -f1)
+    echo "  AVD       $avd_name  ($size)"
+    echo "            $avd_dir"
+    echo "            $AVD_HOME/$avd_name.ini"
+    if [ -n "$shortcut" ] && [ -e "$shortcut" ]; then
+        echo "  Shortcut  $shortcut"
+    else
+        echo "  Shortcut  (none found)"
+    fi
+    echo ""
+    echo "The SDK, system images and your other emulators are not touched."
+    echo ""
+
+    if [ "$assume_yes" -ne 1 ]; then
+        read -p "Type the emulator name to confirm: " confirm
+        if [ "$confirm" != "$avd_name" ]; then
+            echo "Names did not match. Nothing was deleted."
+            return 0
+        fi
+    fi
+
+    if [ -x "$AVDMANAGER" ]; then
+        "$AVDMANAGER" delete avd -n "$avd_name" > /dev/null 2>&1 \
+            || warn "avdmanager could not delete the AVD; removing its files directly."
+    else
+        warn "avdmanager not available; removing AVD files directly."
+    fi
+
+    # avdmanager leaves nothing behind on success, but make sure either way.
+    rm -rf "$avd_dir" "$AVD_HOME/$avd_name.ini"
+
+    if avd_exists "$avd_name" || [ -d "$avd_dir" ]; then
+        die "Failed to remove $avd_name. Check permissions on $AVD_HOME."
+    fi
+    echo -e "${GREEN}✓ Deleted AVD $avd_name${NC}"
+
+    if [ -n "$shortcut" ] && [ -e "$shortcut" ]; then
+        if rm -rf "$shortcut"; then
+            echo -e "${GREEN}✓ Removed shortcut $shortcut${NC}"
+        else
+            warn "Could not remove $shortcut"
+        fi
+    fi
+}
+
 function do_list() {
     echo -e "${YELLOW}Available Android Virtual Devices:${NC}"
     local avds
@@ -811,6 +920,10 @@ case "$1" in
         ;;
     start)
         do_start "$2"
+        ;;
+    delete)
+        shift
+        do_delete "$@"
         ;;
     version)
         echo "android-env version $VERSION"
