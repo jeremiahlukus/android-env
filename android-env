@@ -108,6 +108,8 @@ ADB_BIN="$ANDROID_HOME/platform-tools/$ADB"
 # Every prompt in this script checks noninteractive() first.
 ANDROID_ENV_YES="${ANDROID_ENV_YES:-0}"
 ANDROID_ENV_BOOT_TIMEOUT="${ANDROID_ENV_BOOT_TIMEOUT:-300}"
+# wait_for_boot runs in a subshell, so it reports elapsed time through a file.
+WAIT_WAITED_FILE="${TMPDIR:-/tmp}/android-env-wait.$$"
 
 function noninteractive() {
     [ "$ANDROID_ENV_YES" = "1" ] && return 0
@@ -1137,16 +1139,24 @@ function avd_is_running() {
     pgrep -f -- "-avd $1([[:space:]]|\$)" > /dev/null 2>&1
 }
 
-# Block until the emulator reports a completed boot. Prints the serial.
+# Block until the emulator reports a completed boot. Prints the serial on
+# stdout and sets WAIT_FOR_BOOT_WAITED to the seconds actually spent.
+#
+# Callers use this inside $(...), where die() would only kill the subshell and
+# its message would be lost, so failures are signalled by exit code instead:
+#   0 = booted    2 = adb missing
+#   3 = emulator process exited during boot
+#   4 = timed out
 function wait_for_boot() {
     local avd_name=$1 timeout=${2:-$ANDROID_ENV_BOOT_TIMEOUT}
     local waited=0 serial=""
 
-    [ -x "$ADB_BIN" ] || die "adb not found at $ADB_BIN. Run '$SELF setup' first."
+    [ -x "$ADB_BIN" ] || return 2
 
     while [ "$waited" -lt "$timeout" ]; do
         if ! avd_is_running "$avd_name" && [ "$waited" -gt 10 ]; then
-            die "Emulator process for '$avd_name' exited before finishing boot."
+            printf '%s' "$waited" > "$WAIT_WAITED_FILE" 2>/dev/null || true
+            return 3
         fi
         serial=$(emulator_serial_for "$avd_name" 2>/dev/null || true)
         if [ -n "$serial" ]; then
@@ -1160,7 +1170,20 @@ function wait_for_boot() {
         sleep 2
         waited=$((waited + 2))
     done
-    return 1
+    printf '%s' "$waited" > "$WAIT_WAITED_FILE" 2>/dev/null || true
+    return 4
+}
+
+# Turn a wait_for_boot exit code into an explanation.
+function boot_failure_reason() {
+    local code=$1 avd_name=$2 timeout=$3 waited=""
+    [ -f "$WAIT_WAITED_FILE" ] && waited=$(cat "$WAIT_WAITED_FILE" 2>/dev/null)
+    case "$code" in
+        2) printf "adb not found at %s. Run '%s setup' first." "$ADB_BIN" "$SELF" ;;
+        3) printf "The emulator process for '%s' exited after %ss without finishing boot. Check that virtualization is available and the system image is intact." "$avd_name" "${waited:-?}" ;;
+        4) printf "'%s' did not finish booting within %ss." "$avd_name" "$timeout" ;;
+        *) printf "'%s' failed to boot (code %s)." "$avd_name" "$code" ;;
+    esac
 }
 
 function do_start() {
@@ -1198,11 +1221,12 @@ function do_start() {
 
     if [ "$wait_for" -eq 1 ]; then
         echo "Waiting up to ${timeout}s for boot to complete..."
-        local serial
-        if serial=$(wait_for_boot "$avd_name" "$timeout"); then
+        local serial code
+        serial=$(wait_for_boot "$avd_name" "$timeout"); code=$?
+        if [ "$code" -eq 0 ]; then
             echo -e "${GREEN}✓ $avd_name booted ($serial)${NC}"
         else
-            die "'$avd_name' did not finish booting within ${timeout}s."
+            die "$(boot_failure_reason "$code" "$avd_name" "$timeout")"
         fi
     fi
 }
@@ -1315,11 +1339,14 @@ function do_ensure() {
     fi
 
     # 3. Booted.
-    local serial
-    if ! serial=$(wait_for_boot "$avd_name" "$timeout" 2>/dev/null); then
-        json_or_die "$as_json" "'$avd_name' did not finish booting within ${timeout}s." "$avd_name"
+    local serial code
+    serial=$(wait_for_boot "$avd_name" "$timeout"); code=$?
+    if [ "$code" -ne 0 ]; then
+        json_or_die "$as_json" "$(boot_failure_reason "$code" "$avd_name" "$timeout")" "$avd_name"
+        rm -f "$WAIT_WAITED_FILE"
         return 1
     fi
+    rm -f "$WAIT_WAITED_FILE"
 
     local api abi
     api=$("$ADB_BIN" -s "$serial" shell getprop ro.build.version.sdk 2>/dev/null | tr -d '\r\n')
