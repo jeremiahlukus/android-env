@@ -36,10 +36,17 @@ which are missing:
 
 4. Enter a name for your emulator, for example `MyPixelPhone`.
 
+5. Optional, but recommended. Put the command on your PATH so it works from
+   any directory:
+
+       ./android-env install
+
+   After this you can drop the `./` and run `android-env` from anywhere.
+
 That is all. The first run downloads roughly 1.7 GB and takes a few minutes.
 
-On Windows, run the same two commands from Git Bash. Standard CMD and
-PowerShell will not work.
+On Windows, run the same commands from Git Bash. Standard CMD and PowerShell
+will not work.
 
 
 ## Starting your emulator
@@ -55,7 +62,10 @@ for it the way you would any other application:
 
 From the terminal:
 
-    ./android-env start
+    android-env start
+
+If you have not run `android-env install`, use `./android-env start` from the
+directory holding the script.
 
 
 ## Commands
@@ -68,6 +78,8 @@ From the terminal:
 | `delete [name]` | Deletes an emulator and its desktop launcher |
 | `doctor` | Checks Java, the SDK, and every tool the script needs |
 | `tools` | Shows your command-line tools version and whether a newer one exists |
+| `install [dir]` | Puts the command on your PATH so it runs from anywhere |
+| `uninstall` | Removes it from your PATH |
 | `version` | Prints the version |
 
 ### Deleting an emulator
@@ -79,6 +91,33 @@ You are shown what will be removed and its size, and you must retype the
 emulator name to confirm. Add `-y` to skip the prompt. Deleting is refused
 while that emulator is running, and never touches the SDK, system images or
 your other emulators.
+
+
+## Running it from anywhere
+
+By default you have to be in the directory holding the script and type
+`./android-env`. To use it like any other command:
+
+    ./android-env install
+
+This picks the first directory that is both on your PATH and writable without
+`sudo`, trying `~/.local/bin`, then `~/bin`, then `/usr/local/bin`. It creates
+a symlink, so any later edit to the script takes effect immediately. On systems
+where symlinks are restricted it installs a copy instead and tells you so.
+
+To choose the directory yourself:
+
+    ./android-env install ~/bin
+
+If that directory is not on your PATH, the command prints the exact line to add
+to your shell profile.
+
+To remove it again:
+
+    android-env uninstall
+
+Uninstalling only removes the command from your PATH. Your SDK, emulators and
+desktop launchers are left alone.
 
 
 ## Configuration

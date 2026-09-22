@@ -6,6 +6,16 @@ VERSION="1.0.0"
 # Fail loudly instead of silently continuing past a broken step.
 set -o pipefail
 
+# How this script refers to itself in messages. Once installed on PATH it is
+# invoked as a bare command, so "./" would be wrong; before that it is not on
+# PATH, so "./" is required.
+SELF_NAME=$(basename "$0")
+if command -v "$SELF_NAME" > /dev/null 2>&1; then
+    SELF="$SELF_NAME"
+else
+    SELF="./$SELF_NAME"
+fi
+
 # ---------------------------------------------------------------------------
 # Which command-line tools build to install. Adjustable, highest precedence
 # first:
@@ -122,7 +132,7 @@ function print_header() {
 
 function show_help() {
     print_header
-    echo "Usage: android-env <command>"
+    echo "Usage: $SELF_NAME <command>"
     echo ""
     echo "Commands:"
     echo "  setup     Install Android SDK, Platform Tools, and Emulator"
@@ -131,6 +141,8 @@ function show_help() {
     echo "  start     Start an emulator"
     echo "  delete    Delete an emulator and its desktop shortcut"
     echo "  tools     Show installed vs. available command-line tools"
+    echo "  install   Put this script on your PATH so it runs from anywhere"
+    echo "  uninstall Remove it from your PATH"
     echo "  version   Show version"
     echo ""
 }
@@ -217,7 +229,7 @@ function do_doctor() {
         else
             echo -e "${GREEN}✓ sdkmanager found (cmdline-tools rev ${rev:-unknown})${NC}"
         fi
-        echo "  (run './android-env tools' to compare against the newest build)"
+        echo "  (run '$SELF tools' to compare against the newest build)"
     else
         echo -e "${RED}✗ sdkmanager not found ($SDKMANAGER)${NC}"
     fi
@@ -410,11 +422,11 @@ function install_cmdline_tools() {
         if [ -n "$installed_build" ] && [ -n "$CMD_TOOLS_BUILD" ] \
             && [ "$installed_build" -lt "$CMD_TOOLS_BUILD" ] 2>/dev/null; then
             warn "A newer build is available ($installed_build -> $CMD_TOOLS_BUILD)."
-            warn "Upgrade with: ANDROID_CMDLINE_TOOLS_UPGRADE=1 ./android-env setup"
+            warn "Upgrade with: ANDROID_CMDLINE_TOOLS_UPGRADE=1 $SELF setup"
         elif [ -z "$installed_build" ]; then
             warn "This install predates build tracking, so its age cannot be compared."
             warn "Newest available is build $CMD_TOOLS_BUILD. Upgrade with:"
-            warn "  ANDROID_CMDLINE_TOOLS_UPGRADE=1 ./android-env setup"
+            warn "  ANDROID_CMDLINE_TOOLS_UPGRADE=1 $SELF setup"
         fi
         return 0
     fi
@@ -561,7 +573,7 @@ function create_shortcut() {
         if osacompile -e "do shell script \"$EMULATOR_BIN -avd $avd_name > /dev/null 2>&1 &\"" -o "$app_path" 2>/dev/null; then
             echo -e "${GREEN}✓ App created at $app_path (Searchable in Spotlight!)${NC}"
         else
-            warn "Could not create the macOS app shortcut. Use './android-env start' instead."
+            warn "Could not create the macOS app shortcut. Use '$SELF start' instead."
             return 1
         fi
     elif [[ "$OSTYPE" == "linux-gnu"* ]]; then
@@ -612,7 +624,7 @@ function do_setup() {
         read -p "Do you want to skip installation and exit? (y/n) [y]: " SKIP_INSTALL
         SKIP_INSTALL=${SKIP_INSTALL:-y}
         if [[ "$SKIP_INSTALL" == "y" || "$SKIP_INSTALL" == "Y" ]]; then
-            echo -e "Installation skipped. You can start your emulator anytime using './android-env start'"
+            echo -e "Installation skipped. You can start your emulator anytime using '$SELF start'"
             return 0
         fi
     fi
@@ -694,7 +706,7 @@ function do_setup() {
          echo -e "${GREEN}✓ AVD $AVD_NAME already exists${NC}"
     else
          "$AVDMANAGER" create avd -n "$AVD_NAME" -k "$SYS_IMAGE" --device "$DEV_NAME" --force <<< "no" \
-             || die "avdmanager could not create the AVD. Run './android-env doctor' for details."
+             || die "avdmanager could not create the AVD. Run '$SELF doctor' for details."
 
          AVD_CONFIG="$AVD_HOME/$AVD_NAME.avd/config.ini"
          if [ ! -f "$AVD_CONFIG" ]; then
@@ -760,7 +772,7 @@ function do_tools() {
     echo "  ANDROID_CMDLINE_TOOLS_UPGRADE=1       reinstall/upgrade during setup"
     echo "  ANDROID_ENV_USE_SDKMANAGER=1          use legacy sdkmanager, not the android CLI"
     echo ""
-    echo "Example: ANDROID_CMDLINE_TOOLS_UPGRADE=1 ./android-env setup"
+    echo "Example: ANDROID_CMDLINE_TOOLS_UPGRADE=1 $SELF setup"
     echo ""
 }
 
@@ -813,7 +825,7 @@ function do_delete() {
     fi
 
     avd_exists "$avd_name" \
-        || die "AVD '$avd_name' not found. Run './android-env list' to see what exists."
+        || die "AVD '$avd_name' not found. Run '$SELF list' to see what exists."
 
     # Refuse to delete an AVD that is currently booted. Anchored so that a
     # running "Foo_API_34_v2" does not block deletion of "Foo_API_34".
@@ -872,6 +884,160 @@ function do_delete() {
     fi
 }
 
+# True if $1 is a directory on PATH.
+function dir_on_path() {
+    case ":$PATH:" in
+        *":$1:"*) return 0 ;;
+        *)        return 1 ;;
+    esac
+}
+
+# Absolute path of this script, following a symlink if we were invoked
+# through one.
+function self_path() {
+    local src="$0"
+    case "$src" in
+        */*) ;;
+        *)   src=$(command -v "$src" 2>/dev/null) || return 1 ;;
+    esac
+    # Resolve symlinks so `install` always records the real file.
+    while [ -L "$src" ]; do
+        local link
+        link=$(readlink "$src")
+        case "$link" in
+            /*) src="$link" ;;
+            *)  src="$(dirname "$src")/$link" ;;
+        esac
+    done
+    printf '%s/%s' "$(cd "$(dirname "$src")" && pwd)" "$(basename "$src")"
+}
+
+function do_install() {
+    local target_dir=$1
+    local src
+    src=$(self_path) || die "Could not work out where this script lives."
+    [ -f "$src" ] || die "Could not find this script at $src"
+
+    # Prefer a directory that is already on PATH and writable without sudo.
+    if [ -z "$target_dir" ]; then
+        local d
+        for d in "$HOME/.local/bin" "$HOME/bin" /usr/local/bin; do
+            if [ -d "$d" ] && [ -w "$d" ] && dir_on_path "$d"; then
+                target_dir="$d"
+                break
+            fi
+        done
+        [ -n "$target_dir" ] || target_dir="$HOME/.local/bin"
+    fi
+
+    mkdir -p "$target_dir" || die "Cannot create $target_dir"
+    [ -w "$target_dir" ] || die "$target_dir is not writable. Pass a different directory, e.g.
+  $SELF install \"\$HOME/.local/bin\""
+
+    local name dest
+    name=$(basename "$src")
+    dest="$target_dir/$name"
+
+    if [ -e "$dest" ] || [ -L "$dest" ]; then
+        local existing=""
+        [ -L "$dest" ] && existing=$(self_path_of_link "$dest")
+        if [ "$existing" = "$src" ]; then
+            echo -e "${GREEN}✓ Already installed at $dest${NC}"
+            install_path_hint "$target_dir" "$name"
+            return 0
+        fi
+        warn "$dest already exists and does not point at this script."
+        read -p "Replace it? (y/n) [n]: " replace
+        case "${replace:-n}" in
+            y|Y) ;;
+            *) echo "Left $dest alone. Nothing was installed."; return 0 ;;
+        esac
+    fi
+
+    # A symlink means edits to the script take effect immediately. Copy is the
+    # fallback for systems where symlinks are restricted (e.g. plain Windows).
+    if ln -sfn "$src" "$dest" 2>/dev/null; then
+        echo -e "${GREEN}✓ Linked $dest -> $src${NC}"
+    elif cp "$src" "$dest" 2>/dev/null; then
+        chmod +x "$dest"
+        warn "Symlinks unavailable, so a copy was installed instead."
+        warn "Re-run '$SELF install' after changing the script to refresh it."
+        echo -e "${GREEN}✓ Copied to $dest${NC}"
+    else
+        die "Could not install to $dest"
+    fi
+
+    chmod +x "$src" 2>/dev/null || true
+    install_path_hint "$target_dir" "$name"
+}
+
+# Resolve what a symlink ultimately points at.
+function self_path_of_link() {
+    local src=$1 link
+    while [ -L "$src" ]; do
+        link=$(readlink "$src")
+        case "$link" in
+            /*) src="$link" ;;
+            *)  src="$(dirname "$src")/$link" ;;
+        esac
+    done
+    printf '%s' "$src"
+}
+
+function install_path_hint() {
+    local target_dir=$1 name=$2
+
+    if ! dir_on_path "$target_dir"; then
+        echo ""
+        warn "$target_dir is not on your PATH yet. Add this line to your shell profile:"
+        echo "  export PATH=\"$target_dir:\$PATH\""
+        echo ""
+        echo "Then open a new terminal and run: $name setup"
+        return 0
+    fi
+
+    local resolved
+    resolved=$(command -v "$name" 2>/dev/null)
+    if [ -n "$resolved" ]; then
+        echo "You can now run '$name' from any directory."
+        if [ "$resolved" != "$target_dir/$name" ]; then
+            warn "Note: '$name' currently resolves to $resolved, which is earlier on your PATH."
+        fi
+    else
+        warn "Installed, but '$name' is not resolving yet. Open a new terminal and retry."
+    fi
+}
+
+function do_uninstall() {
+    local name="android-env" removed=0 d dest src
+    src=$(self_path 2>/dev/null || true)
+
+    for d in $(printf '%s' "$PATH" | tr ':' ' '); do
+        dest="$d/$name"
+        [ -e "$dest" ] || [ -L "$dest" ] || continue
+        # Never remove the script from its own source directory.
+        if [ -n "$src" ] && [ "$dest" = "$src" ]; then
+            continue
+        fi
+        echo "Found $dest"
+        if rm -f "$dest" 2>/dev/null; then
+            echo -e "${GREEN}✓ Removed $dest${NC}"
+            removed=$((removed + 1))
+        else
+            warn "Could not remove $dest (try a directory you own, or use sudo)"
+        fi
+    done
+
+    if [ "$removed" -eq 0 ]; then
+        echo "Nothing to uninstall: no '$name' found on your PATH outside its source directory."
+    else
+        echo ""
+        echo "Your SDK, emulators and shortcuts were not touched."
+        # $SELF would name the bare command, which no longer resolves.
+        echo "Delete emulators with '${src:-./android-env} delete' if you want those gone too."
+    fi
+}
+
 function do_list() {
     echo -e "${YELLOW}Available Android Virtual Devices:${NC}"
     local avds
@@ -879,7 +1045,7 @@ function do_list() {
     if [ -n "$avds" ]; then
         echo "$avds"
     else
-        echo -e "${RED}No AVDs found in $AVD_HOME. Run 'android-env setup' first.${NC}"
+        echo -e "${RED}No AVDs found in $AVD_HOME. Run '$SELF setup' first.${NC}"
     fi
 }
 
@@ -890,14 +1056,14 @@ function do_start() {
         AVD_NAME=$(list_avd_names)
         AVD_NAME=${AVD_NAME%%$'\n'*}
         if [ -z "$AVD_NAME" ]; then
-            die "No AVDs found. Run 'android-env setup' first."
+            die "No AVDs found. Run '$SELF setup' first."
         fi
         echo "No AVD specified, using default: $AVD_NAME"
     elif ! avd_exists "$AVD_NAME"; then
-        die "AVD '$AVD_NAME' not found. Run './android-env list' to see what exists."
+        die "AVD '$AVD_NAME' not found. Run '$SELF list' to see what exists."
     fi
 
-    [ -x "$EMULATOR_BIN" ] || die "Emulator not installed at $EMULATOR_BIN. Run 'android-env setup' first."
+    [ -x "$EMULATOR_BIN" ] || die "Emulator not installed at $EMULATOR_BIN. Run '$SELF setup' first."
 
     echo -e "Starting emulator: ${YELLOW}$AVD_NAME${NC}..."
     nohup "$EMULATOR_BIN" -avd "$AVD_NAME" > /dev/null 2>&1 &
@@ -918,6 +1084,12 @@ case "$1" in
     tools)
         do_tools
         ;;
+    install)
+        do_install "$2"
+        ;;
+    uninstall)
+        do_uninstall
+        ;;
     start)
         do_start "$2"
         ;;
@@ -926,7 +1098,7 @@ case "$1" in
         do_delete "$@"
         ;;
     version)
-        echo "android-env version $VERSION"
+        echo "$SELF_NAME version $VERSION"
         ;;
     *)
         show_help
